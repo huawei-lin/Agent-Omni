@@ -1,6 +1,6 @@
 from .state import State
 from langgraph.graph import StateGraph, START, END
-from .nodes import master_reasoning, master_dispatcher, master_decision, master_dispatcher_1
+from .nodes import react_reason, react_observe, summaries_ready, ACTION_CALL_AGENTS
 from .subagents.text_agent import text_agent, text_summarize
 from .subagents.image_agent import image_agent, image_summarize
 from .subagents.video_agent import video_agent, video_summarize
@@ -9,67 +9,39 @@ from .config import config
 
 SUBAGENT_NAMES = config["agents"]["names"]
 
-def agent_selected(agent_name: str):
-    def condition(state: State) -> bool:
-        # return agent_name in state.get("reasoning_result_json", {}).get("agent_questions", {}).keys()
-        return True
 
-    return condition
-
-
-def next_round(state):
-    # return state["decision_result"]["is_final"] == False and state["max_round_num"] > state["cur_round_num"]
-    return state["max_round_num"] > state["cur_round_num"]
+def route_action(state: State):
+    """Act: run only the agents selected in the latest step, or stop on a final answer."""
+    step = state["reasoning_result"]
+    if step["action"] != ACTION_CALL_AGENTS:
+        return END
+    return [instruction["agent_name"] for instruction in step["agent_instructions"]]
 
 
 def _build_graph():
     builder = StateGraph(State)
 
-    for node in [
-        master_reasoning,
-        master_dispatcher,
-        master_dispatcher_1,
-        master_decision,
-        text_agent,
-        image_agent,
-        video_agent,
-        audio_agent,
-        text_summarize,
-        image_summarize,
-        video_summarize,
-        audio_summarize,
-    ]:
+    summarize_nodes = [text_summarize, image_summarize, video_summarize, audio_summarize]
+    agent_nodes = [text_agent, image_agent, video_agent, audio_agent]
+
+    for node in [*summarize_nodes, *agent_nodes, summaries_ready, react_reason, react_observe]:
         builder.add_node(node)
 
-    builder.add_edge(START, text_summarize.__name__)
-    builder.add_edge(START, image_summarize.__name__)
-    builder.add_edge(START, video_summarize.__name__)
-    builder.add_edge(START, audio_summarize.__name__)
+    # Summarize every modality once, in parallel.
+    for node in summarize_nodes:
+        builder.add_edge(START, node.__name__)
+        builder.add_edge(node.__name__, summaries_ready.__name__)
+    builder.add_edge(summaries_ready.__name__, react_reason.__name__)
 
-    builder.add_edge(text_summarize.__name__, master_dispatcher_1.__name__)
-    builder.add_edge(image_summarize.__name__, master_dispatcher_1.__name__)
-    builder.add_edge(video_summarize.__name__, master_dispatcher_1.__name__)
-    builder.add_edge(audio_summarize.__name__, master_dispatcher_1.__name__)
-
-    builder.add_edge(master_dispatcher_1.__name__, master_reasoning.__name__)
-
-    for agent_name in SUBAGENT_NAMES:
-        builder.add_edge(
-            master_reasoning.__name__, agent_name
-        )  # TODO: Consider conditional edge
-        builder.add_edge(agent_name, master_dispatcher.__name__)
-
-    builder.add_edge(master_dispatcher.__name__, master_decision.__name__)
-    # builder.add_edge(master_decision.__name__, END)
-
+    # ReAct loop: reason (thought + action) -> selected agents -> observe -> reason ...
     builder.add_conditional_edges(
-        master_decision.__name__,
-        next_round,
-        {
-            True: master_reasoning.__name__,
-            False: END,
-        }
+        react_reason.__name__,
+        route_action,
+        [*SUBAGENT_NAMES, END],
     )
+    for agent_name in SUBAGENT_NAMES:
+        builder.add_edge(agent_name, react_observe.__name__)
+    builder.add_edge(react_observe.__name__, react_reason.__name__)
 
     return builder.compile()
 

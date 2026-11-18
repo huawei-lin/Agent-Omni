@@ -5,14 +5,17 @@ from pydantic import BaseModel
 
 class State(MessagesState):
     query: str
-    cur_round_num: int
-    max_round_num: int
+    cur_round_num: int  # number of agent-calling rounds taken so far
+    max_round_num: int  # maximum number of agent-calling rounds before a forced final answer
 
     final_answer_structure: Optional[Type[BaseModel]]
     field_by_field: bool
 
-    reasoning_result: Any
-    decision_result: Any
+    # ReAct trajectory: one entry per agent-calling step, each with
+    # "thought", "action", "agent_instructions" and (once the agents return) "observation".
+    react_steps: List[Any]
+    reasoning_result: Any  # latest step (thought + action)
+    decision_result: Any   # {"thought", "final_answer", "is_final"}; is_final is False when the round budget forced the answer
 
     text_summary: Any
     image_summary: Any
@@ -28,11 +31,6 @@ class State(MessagesState):
     image_agent_result_list: Any
     video_agent_result_list: Any
     audio_agent_result_list: Any
-
-    reasoning_result_list: Any
-    decision_result_list: Any
-    reasoning_prompt_list: Any
-    decision_prompt_list: Any
 
     text: List[Any]
     image: List[Any]

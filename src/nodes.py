@@ -1,222 +1,197 @@
-from src.models import master_model
-from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage
-from .state import State
-from .config import config
-from .utils import combine_summaries, combine_historical_message, combine_available_agent, extract_json_array, postprocessing
-from typing import List, Dict, Optional, Type
-from pydantic import BaseModel, Field, create_model, conlist
-from langchain_aws.chat_models.bedrock import convert_messages_to_prompt_llama3
-import traceback
-import time
 import json
-import re
+import time
+import traceback
+from typing import List, Literal, Optional, Type
 
 from langchain.output_parsers import OutputFixingParser, PydanticOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from pydantic import BaseModel, Field, conlist, create_model
+
+from src.models import master_model
+
+from .config import config
+from .state import State
+from .utils import combine_available_agent, combine_summaries, postprocessing
+
+ACTION_CALL_AGENTS = "call_agents"
+ACTION_FINAL_ANSWER = "final_answer"
 
 
-
-def get_messages(state, system_prompt, format_instructions):
-   return [
-       SystemMessage(content=[{
-           "type": "text",
-           "text": system_prompt + f"\n\n{format_instructions}"
-       }]),
-       HumanMessage(content=[{
-           "type": "text",
-           "text": state["query"]
-       }]),
-   ]
+def available_agent_names(state) -> List[str]:
+    """Agents whose modality is present in the user's input."""
+    return [
+        f"{name}_agent"
+        for name in config["agents"]["supported"]
+        if (state.get(f"{name}_summary") or "").strip()
+    ]
 
 
-def master_reasoning(state: State):
-    start = time.time()
+def build_step_structure(state, force_final: bool) -> Type[BaseModel]:
+    """Schema of one ReAct step: a thought plus exactly one action."""
+    final_answer_structure: Optional[Type[BaseModel]] = state.get("final_answer_structure") or str
+    final_answer_description = (
+        "The answer shown to the end user. If the user's query includes output format "
+        "requirements, follow them strictly."
+    )
+    thought = (str, Field(
+        description="Your reasoning about what is known so far, what is still missing, and what to do next."
+    ))
 
-    cur_round_num = 1 if "cur_round_num" not in state.keys() else state["cur_round_num"] + 1
-    input_summaries = combine_summaries(state)
-    histrical_message = combine_historical_message(state)
-    available_agent_info = combine_available_agent(state)
+    if force_final:
+        return create_model(
+            "ReActFinalStep",
+            thought=thought,
+            action=(Literal[ACTION_FINAL_ANSWER], Field(description=f'Must be "{ACTION_FINAL_ANSWER}".')),
+            final_answer=(final_answer_structure, Field(description=final_answer_description)),
+        )
 
     class AgentInstruction(BaseModel):
         agent_name: str = Field(
-                description=f"The identifier for the agent (selected from agent pool: {available_agent_info}) that are most suitable for handling this intent."
+            description=f"The agent to call, selected from the agent pool: {available_agent_names(state)}."
         )
         questions: conlist(str, min_length=1) = Field(
-            description="A list of specific questions or instructions for this agent."
-        )
-    
-
-    class MasterReasoningStructure(BaseModel):
-        user_intent: str = Field(
-            description="The user's goal or intention, typically inferred from a multimodal input or query."
-        )
-        agent_instructions: conlist(AgentInstruction, min_length=1) = Field(
-            description="A list of instructions for each agent, containing the agent name and related questions."
+            description="Self-contained questions or instructions for this agent."
         )
 
+    return create_model(
+        "ReActStep",
+        thought=thought,
+        action=(Literal[ACTION_CALL_AGENTS, ACTION_FINAL_ANSWER], Field(
+            description=(
+                f'"{ACTION_CALL_AGENTS}" to gather more evidence from the agents, '
+                f'or "{ACTION_FINAL_ANSWER}" to finish.'
+            )
+        )),
+        agent_instructions=(Optional[List[AgentInstruction]], Field(
+            default=None,
+            description=f'Required when action is "{ACTION_CALL_AGENTS}", otherwise null.',
+        )),
+        final_answer=(Optional[final_answer_structure], Field(
+            default=None,
+            description=f'Required when action is "{ACTION_FINAL_ANSWER}", otherwise null. {final_answer_description}',
+        )),
+    )
 
-    system_prompt = f"""You are the Reasoning Module in an "Understanding Anything" system. This system is designed to interpret user input across multiple modalities—text, image, video, and audio—by orchestrating existing foundation models through dynamic agents in several iterative reasoning loops. The system does not rely on fine-tuning or retraining.
 
-The user's input may include any combination of modalities. The system comprises three main components: Reasoning, Dispatcher, and Decision.
+def build_system_prompt(state, force_final: bool) -> str:
+    step_num = len(state.get("react_steps") or []) + 1
+    max_round_num = state.get("max_round_num", 1)
 
-You are currently in the Reasoning stage. Your next stage is the Dispatcher, which will route tasks to appropriate downstream agents (referred to as "passengers") specialized for each modality. Your role is not to answer the user's query directly. Instead, you must analyze the input and prepare tasks for the Dispatcher to execute. In some cases, you may be prompted with only a small subtask rather than the entire problem—when that happens, focus solely on the subtask you've been given, without assuming responsibility for the broader task. If decomposition is needed, break the input into clear, actionable subtasks to be handled downstream.
+    if force_final:
+        budget = (
+            "You cannot call agents anymore. "
+            f'You must now respond with action "{ACTION_FINAL_ANSWER}" using the evidence collected so far.'
+        )
+    else:
+        budget = (
+            f"This is step {step_num}. You may call agents in at most {max_round_num} rounds in total; "
+            "after that you must give the final answer."
+        )
 
-Specifically:
-1. You might not receive the short summarization of the input material of different modelities.
-1. Interpret the user's input (including the query and any multimodal data like text, image, video, audio, or others).
-2. Identify relevant data modalities involved.
-3. Understanding the provided historical messages, including any suggestions, shortcomings, etc.
-4. Select the appropriate specialized agent(s) from the Agents Pool for further action.
-5. Formulate precise and valuable follow-up questions for each selected agent to help them extract insights that contribute to answering the user's query. These questions will be used as prompts for the downstream agents.
-    - Important: Downstream agents have access only to the user's input in their specific modality (e.g., text, image, video, or audio). They do not have access to the user's original query or any broader context.
-    - Do not assume agents have any prior knowledge of the user's intent beyond the modality-specific input. Questions are independent
-    - Therefore, your questions must include all necessary context (information from user's query) or instructions explicitly.
-    - Focus on clarity, completeness, and precision—frame each question to maximize the relevance and usefulness of the agent's response.
-    - You are encouraged to ask multiple diverse questions for each agent at a round (more than three), as this may help other stages gain a more comprehensive understanding of the provided input.
-6. Output a structured reasoning result including:
-    - User Intent
-    - Required Modality or Modalities
-    - Suggested Agent(s)
-    - Questions for each selected agent
-7. If this is not the first round, the provided question should take into account the suggestions from the previous round.
-8. If this is the first round, consider including the user's original query as one of the questions sent to each selected agent. This can help the agents provide a more relevant initial analysis or summary.
+    return f"""You are the Master Agent of the "Understanding Anything" system. This system interprets user input across multiple modalities (text, image, video, and audio) by orchestrating existing foundation models through specialized agents. The system does not rely on fine-tuning or retraining.
+
+You work in a ReAct loop. At every step you produce a Thought and then exactly one Action:
+- Thought: reason about the user's intent, what the observations so far have established, what is still missing or inconsistent, and what to do next.
+- Action "{ACTION_CALL_AGENTS}": send questions to one or more agents from the Agent Pool. Their answers come back to you as an Observation, and you then take another step.
+- Action "{ACTION_FINAL_ANSWER}": finish and return the answer to the user.
+
+Rules for "{ACTION_CALL_AGENTS}":
+- You cannot see the raw input yourself. You only have the short summaries below, so rely on the agents for evidence.
+- Each agent has access only to the user's input in its own modality. It does not see the user's query, the other modalities, the other questions, or any earlier step.
+- Therefore every question must be self-contained and explicitly include all context it needs from the user's query.
+- Only call agents that can contribute. You may call several agents in one step, and ask each of them several diverse questions.
+- In the first step, consider including the user's original query as one of the questions for each selected agent.
+- In later steps, do not repeat questions that were already answered. Ask follow-up questions that resolve gaps, ambiguities, or contradictions in earlier observations.
+
+Rules for "{ACTION_FINAL_ANSWER}":
+- Choose it only when the observations are sufficient to answer the user's query completely and correctly. If you are not confident, gather more evidence first.
+- Synthesize the observations into one coherent answer. Never repeat agent responses verbatim.
+- Be strictly faithful to the user's query and intent. Do not speculate or add information the user did not ask for.
+- If the user's query specifies an output format, follow it strictly.
+- Do not mention agents, steps, or observations. Answer as if this were a single interaction.
 
 Background:
-1. This is the {cur_round_num} round of reasoning.
-2. You might receive the historical messages from the previous rounds.
-{histrical_message}
-3. Modality of user's input with short summaries:
-{input_summaries}
-4. Agent Pool:
-{available_agent_info}
-
-You must not generate a final answer to the user's question. Your goal is reasoning and delegation only."""
+1. Modality of user's input with short summaries:
+{combine_summaries(state)}
+2. Agent Pool:
+{combine_available_agent(state)}
+3. {budget}"""
 
 
-    retry = config["system"]["retry_times"]
+def format_observation(step) -> str:
+    return "Observation:\n" + json.dumps(step.get("observation"), ensure_ascii=False, indent=2, default=str)
 
-    parser = PydanticOutputParser(pydantic_object=MasterReasoningStructure)
-    fixing_parser = OutputFixingParser.from_llm(parser=parser, llm=master_model.model)
-    format_instructions = parser.get_format_instructions()
-    while retry:
-        try:
 
-            messages = get_messages(state, system_prompt, format_instructions)
-            response = master_model.invoke(messages)
-            try:
-                result = parser.parse(response.content).dict()
-            except:
-                result = fixing_parser.parse(response.content).dict()
-            break
-        except Exception as e:
-            retry -= 1
-            print(e, "remaining retry time:", retry)
-            if retry <= 0:
-                raise e
-            time.sleep(2)
+def build_messages(state, system_prompt, format_instructions):
+    """System prompt, the user's query, then the Thought/Action/Observation trajectory."""
+    messages = [
+        SystemMessage(content=[{"type": "text", "text": system_prompt + f"\n\n{format_instructions}"}]),
+        HumanMessage(content=[{"type": "text", "text": state["query"]}]),
+    ]
+    for step in state.get("react_steps") or []:
+        action = {
+            "thought": step["thought"],
+            "action": step["action"],
+            "agent_instructions": step.get("agent_instructions"),
+            "final_answer": None,
+        }
+        messages.append(AIMessage(content=json.dumps(action, ensure_ascii=False)))
+        messages.append(HumanMessage(content=[{"type": "text", "text": format_observation(step)}]))
+    return messages
 
-    import json
-    # print("-"*10, f"{cur_round_num} round", "-"*10)
-    # print("="*10, "reasoning", "="*10)
-    # print(json.dumps(result, indent=4))
 
-    end = time.time()
-    # print(f"[{cur_round_num} master_reasoning] Time taken: {end - start:.3f}s")
+def normalize_step(state, result: dict, force_final: bool) -> dict:
+    """Validate one parsed step and merge duplicated agents. Raises ValueError to trigger a retry."""
+    if force_final or result["action"] == ACTION_FINAL_ANSWER:
+        if result.get("final_answer") is None:
+            raise ValueError(f'action is "{ACTION_FINAL_ANSWER}" but final_answer is empty')
+        return {
+            "thought": result["thought"],
+            "action": ACTION_FINAL_ANSWER,
+            "final_answer": result["final_answer"],
+        }
+
+    available = available_agent_names(state)
+    merged = {}
+    for instruction in result.get("agent_instructions") or []:
+        name = instruction["agent_name"]
+        if name not in available:
+            continue
+        merged.setdefault(name, [])
+        merged[name].extend(q for q in instruction["questions"] if q not in merged[name])
+    if not merged:
+        raise ValueError(f'action is "{ACTION_CALL_AGENTS}" but no agent from {available} was selected')
 
     return {
-        "reasoning_prompt_list": [system_prompt] if not state.get("reasoning_prompt_list", None) else [*state["reasoning_prompt_list"], system_prompt],
-        "reasoning_result": result, 
-        "reasoning_result_list": [result] if not state.get("reasoning_result_list", None) else [*state["reasoning_result_list"], result],
-        "cur_round_num": cur_round_num
+        "thought": result["thought"],
+        "action": ACTION_CALL_AGENTS,
+        "agent_instructions": [
+            {"agent_name": name, "questions": questions} for name, questions in merged.items()
+        ],
     }
 
 
-def master_dispatcher(state: State):
-    return state
+def react_reason(state: State):
+    """Thought + Action: decide whether to call agents again or to answer."""
+    steps = state.get("react_steps") or []
+    force_final = len(steps) >= state.get("max_round_num", 1) or not available_agent_names(state)
 
-def master_dispatcher_1(state: State):
-    return state
+    structure = build_step_structure(state, force_final)
+    parser = PydanticOutputParser(pydantic_object=structure)
+    fixing_parser = OutputFixingParser.from_llm(parser=parser, llm=master_model.model)
 
-
-def master_decision(state: State):
-    start = time.time()
-
-    final_answer_structure: Optional[Type[BaseModel]] = state.get("final_answer_structure", str)
-
-    MasterDecisionStructure = create_model(
-        "MasterDecisionStructure",
-        final_answer=(final_answer_structure, Field(
-            description="The synthesized answer intended for showing to the end user. If the user's query includes output format requirements, please follow them strictly."
-        )),
-        is_final=(bool, Field(
-            description="Indicates whether this is a complete and final answer (True), or if more work/follow-up is needed (False)."
-        )),
-        suggestions_for_next_round=(conlist(str, min_length=1), Field(
-            description="You must always include non-empty 'suggestions_for_next_round'. Even if the answer is final, you must still provide suggestions for improvement, validation, or alternative framing."
-        ))
-    )
-
-    input_summaries = combine_summaries(state)
-    histrical_message = combine_historical_message(state)
-    available_agent_info = combine_available_agent(state)
-    
-    cur_round_num = state["cur_round_num"]
-
-    system_prompt = f"""You are the Decision Module of the "Understanding Anything" system. Your role is to receive the results from all specialized agents (e.g., text_agent, image_agent, audio_agent, video_agent) and synthesize them into a comprehensive answer to the user's original query.
-
-Responsibilities:
-Task 1. Synthesize a complete, coherent, and concise answer to the user's original query by integrating:
-   - The user's multimodal input (text, image, audio, or video),
-   - The reasoning output from the previous Reasoning Module,
-   - All responses returned by invoked agents.
-   - If an answer from a previous round is available, you may use it as a reference to inform your response.
-   - However, do not mention or refer to the prior answer in the final answer, as the user is unaware of any 'previous rounds.' The final answer should address the user's query directly, as if it were the only interaction.
-
-Task 2. Evaluate completeness and provide feedback:
-   - Always assess the synthesized answer for completeness, clarity, and alignment with the user's intent.
-   - In all cases, suggest how future rounds can be more accurate or efficient.
-   - If the answer is incomplete or ambiguous, clearly explain the gaps, and specify what additional analysis, clarification, or agent input is required to move forward. Also include suggestions for next round to improve the current version.
-   - If the answer fully satisfies the user's query, present it as Final Output. You still have to provide suggestions for next round on how the analysis, synthesis, or communication could be improved.
-   - Actively scan for logical inconsistencies, incorrect assumptions, or misaligned interpretations—even when the answer appears complete. When possible, propose alternative reasoning paths or reframe ambiguous user intent to surface potential misunderstandings.
-   - Your suggestions for the next round should focus on improving the quality of the final answer and should closely align with the user's query.
-   - If you are not 100% confident in the completeness or correctness of the answer, initiate a next round of reasoning or agent processing.
-
-Task 3. Determine and recommend next steps:
-   - Always state whether further agent processing is needed.
-   - You must verify whether the final answer meets the format requirements specified in the user's query.
-   - In every case, regardless of output quality, provide concrete suggestions for improvement—such as refining agent prompts, re-evaluating multimodal inputs, or clarifying ambiguous reasoning steps.
-   - Your output must always move the understanding forward, even when the answer is not yet final.
-
-Background:
-1. This is the {cur_round_num} round of decision.
-2. Modality of user's input with short summaries:
-{input_summaries}
-3. Results of agents and decision of previous rounds.
-{histrical_message}
-4. Agent Pool:
-{available_agent_info}
-
-Guidelines:
-- Never repeat agent responses verbatim. Always distill and integrate their content into a unified, user-focused answer.
-- Whether the output is marked as final or not, you must always provide actionable recommendations to improve the analysis or clarity of the answer.
-- Be strictly faithful to the user's original query and intent.
-  - Do not speculate, over-extend, or introduce unrelated or unnecessary information.
-  - Only answer the user's query; do not add context the user didn't ask for.
-"""
+    system_prompt = build_system_prompt(state, force_final)
+    messages = build_messages(state, system_prompt, parser.get_format_instructions())
 
     retry = config["system"]["retry_times"]
-
-    parser = PydanticOutputParser(pydantic_object=MasterDecisionStructure)
-    fixing_parser = OutputFixingParser.from_llm(parser=parser, llm=master_model.model)
-    format_instructions = parser.get_format_instructions()
     while retry:
         try:
-            messages = get_messages(state, system_prompt, format_instructions)
-            response = master_model.invoke(messages)
+            content = postprocessing(master_model.invoke(messages))
             try:
-                result = parser.parse(response.content).dict()
-            except:
-                result = fixing_parser.parse(response.content).dict()
+                result = parser.parse(content).model_dump()
+            except Exception:
+                result = fixing_parser.parse(content).model_dump()
+            step = normalize_step(state, result, force_final)
             break
         except Exception as e:
             retry -= 1
@@ -225,16 +200,36 @@ Guidelines:
             if retry <= 0:
                 raise e
             time.sleep(2)
-    
-    import json
-    # print("="*10, "decision_result", "="*10)
-    # print(json.dumps(result, indent=4))
 
-    end = time.time()
-    # print(f"[{cur_round_num} master_decision] Time taken: {end - start:.3f}s")
+    if step["action"] == ACTION_FINAL_ANSWER:
+        return {
+            "reasoning_result": step,
+            "decision_result": {
+                "thought": step["thought"],
+                "final_answer": step["final_answer"],
+                "is_final": not force_final,
+            },
+        }
 
     return {
-        "decision_prompt_list": [system_prompt] if not state.get("decision_prompt_list", None) else [*state["decision_prompt_list"], system_prompt],
-        "decision_result": result,
-        "decision_result_list": [result] if not state.get("decision_result_list", None) else [*state["decision_result_list"], result]
+        "reasoning_result": step,
+        "react_steps": [*steps, step],
+        "cur_round_num": len(steps) + 1,
     }
+
+
+def react_observe(state: State):
+    """Observation: attach the answers of the agents called in the latest step."""
+    steps = list(state.get("react_steps") or [])
+    step = dict(steps[-1])
+    step["observation"] = {
+        instruction["agent_name"]: state.get(f"{instruction['agent_name']}_result")
+        for instruction in step["agent_instructions"]
+    }
+    steps[-1] = step
+    return {"react_steps": steps}
+
+
+def summaries_ready(state: State):
+    """Join point after the per-modality summaries."""
+    return {}
